@@ -1,0 +1,235 @@
+name: bot-review-gate
+
+# Server-side gate that fails the merge gate when CodeRabbit or Cursor
+# Bugbot have unresolved Major/High/Medium severity comments on a PR.
+# Combined with branch protection ("require bot-review-check to pass"),
+# this catches every merge attempt regardless of where it originates:
+# Claude Code on Mac, cursor-agent on Beast, codex / claude-cli, the
+# GitHub web UI, manual `gh pr merge`, anything.
+#
+# Local hooks (.claude/hooks/shared/pre-merge-bot-check.sh) remain as
+# fast-feedback during development but are no longer the source of truth.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  pull_request_review:
+    types: [submitted, edited]
+  pull_request_review_comment:
+    types: [created, edited]
+  issue_comment:
+    types: [created, edited]
+
+jobs:
+  check:
+    # For issue_comment events, only run on PR comments (not plain issues)
+    if: ${{ github.event_name != 'issue_comment' || github.event.issue.pull_request != null }}
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+      checks: write
+
+    steps:
+      - name: Classify bot review comments
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber =
+              context.payload.pull_request?.number ??
+              context.payload.issue?.number;
+
+            if (!prNumber) {
+              core.info("No PR number on this event, skipping.");
+              return;
+            }
+
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+            const headSha = pr.head.sha;
+
+            // Fetch review THREADS via GraphQL so we can filter out
+            // resolved / outdated comments. The REST listReviewComments
+            // endpoint doesn't expose thread resolution status, which led
+            // an earlier version of this workflow to count already-fixed
+            // findings as blocking (Cursor flagged this on PR #9).
+            const threadQuery = `
+              query($owner: String!, $repo: String!, $pr: Int!, $cursor: String) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $pr) {
+                    reviewThreads(first: 100, after: $cursor) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes {
+                        isResolved
+                        isOutdated
+                        comments(first: 20) {
+                          nodes {
+                            author { login }
+                            body
+                            path
+                            line
+                            originalLine
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }`;
+
+            const comments = [];
+            let cursor = null;
+            let skippedResolved = 0;
+            let skippedOutdated = 0;
+            do {
+              const res = await github.graphql(threadQuery, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pr: prNumber,
+                cursor,
+              });
+              const threads = res.repository.pullRequest.reviewThreads;
+              for (const t of threads.nodes) {
+                if (t.isResolved) { skippedResolved += t.comments.nodes.length; continue; }
+                if (t.isOutdated) { skippedOutdated += t.comments.nodes.length; continue; }
+                for (const c of t.comments.nodes) {
+                  comments.push({
+                    user: { login: c.author?.login ?? "" },
+                    body: c.body ?? "",
+                    path: c.path ?? "?",
+                    line: c.line ?? c.originalLine ?? 0,
+                    original_line: c.originalLine ?? 0,
+                  });
+                }
+              }
+              cursor = threads.pageInfo.hasNextPage ? threads.pageInfo.endCursor : null;
+            } while (cursor);
+
+            core.info(
+              `Fetched ${comments.length} live comments ` +
+              `(skipped ${skippedResolved} resolved, ${skippedOutdated} outdated)`,
+            );
+
+            function classify(author, body) {
+              if (/^cursor(\[bot\])?$/i.test(author)) {
+                if (/\*\*High Severity\*\*/i.test(body)) return "high";
+                if (/\*\*Medium Severity\*\*/i.test(body)) return "medium";
+                if (/\*\*Low Severity\*\*/i.test(body)) return "low";
+                return "unknown";
+              }
+              if (/^coderabbitai(\[bot\])?$/i.test(author)) {
+                if (/🔴 Critical|Critical_|🟣/u.test(body)) return "critical";
+                if (/🟠 Major/u.test(body)) return "major";
+                if (/🟡 Minor/u.test(body)) return "minor";
+                if (/🔵/u.test(body)) return "trivial";
+                return "unknown";
+              }
+              return "human";
+            }
+
+            const HIGH = [];
+            const MEDIUM = [];
+            const LOW = [];
+            const UNKNOWN = [];
+
+            for (const c of comments) {
+              const author = c.user?.login ?? "";
+              if (!/^(cursor|coderabbitai)/i.test(author)) continue;
+
+              const body = c.body ?? "";
+              const sev = classify(author, body);
+
+              // Extract title: first line that starts with `### ` or `**`,
+              // else the first non-empty line.
+              const lines = body.split("\n");
+              let title =
+                lines.find((l) => /^(### |\*\*)/.test(l.trim())) ??
+                lines.find((l) => l.trim().length > 0) ??
+                "";
+              title = title.replace(/^### /, "").replace(/\*\*/g, "").trim().slice(0, 120);
+
+              const entry = {
+                author,
+                path: c.path ?? "?",
+                line: c.line ?? c.original_line ?? 0,
+                title,
+                severity: sev,
+              };
+
+              if (["high", "critical", "major"].includes(sev)) HIGH.push(entry);
+              else if (sev === "medium") MEDIUM.push(entry);
+              else if (["low", "minor", "trivial"].includes(sev)) LOW.push(entry);
+              else UNKNOWN.push(entry);
+            }
+
+            const blocking = HIGH.length + MEDIUM.length;
+            const conclusion = blocking > 0 ? "failure" : "success";
+
+            const titleStr =
+              blocking > 0
+                ? `${blocking} blocking bot finding${blocking === 1 ? "" : "s"}`
+                : "no blocking bot findings";
+
+            const summaryStr =
+              blocking > 0
+                ? `**${blocking} blocking** (${HIGH.length} high/major + ${MEDIUM.length} medium). ` +
+                  `${LOW.length} low/minor deferrable, ${UNKNOWN.length} unclassified.`
+                : `${LOW.length} low/minor comment${LOW.length === 1 ? "" : "s"} (deferrable). ` +
+                  `${UNKNOWN.length} unclassified.`;
+
+            const sectionLines = [];
+            const fmt = (e) =>
+              `- [${e.author}] \`${e.path}:${e.line}\` — ${e.title}`;
+            if (HIGH.length) {
+              sectionLines.push(`### 🔴 BLOCKING — ${HIGH.length} High/Major/Critical`);
+              HIGH.forEach((e) => sectionLines.push(fmt(e)));
+              sectionLines.push("");
+            }
+            if (MEDIUM.length) {
+              sectionLines.push(`### 🟠 BLOCKING — ${MEDIUM.length} Medium`);
+              MEDIUM.forEach((e) => sectionLines.push(fmt(e)));
+              sectionLines.push("");
+            }
+            if (LOW.length) {
+              sectionLines.push(`### 🟡 Deferrable — ${LOW.length} Low/Minor/Trivial`);
+              LOW.forEach((e) => sectionLines.push(fmt(e)));
+              sectionLines.push("");
+            }
+            if (UNKNOWN.length) {
+              sectionLines.push(`### ℹ️ Unclassified — ${UNKNOWN.length}`);
+              UNKNOWN.forEach((e) => sectionLines.push(fmt(e)));
+              sectionLines.push("");
+            }
+            if (sectionLines.length === 0) {
+              sectionLines.push("_No bot review comments yet._");
+            }
+
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: "bot-review-check",
+              head_sha: headSha,
+              status: "completed",
+              conclusion,
+              output: {
+                title: titleStr,
+                summary: summaryStr,
+                text: sectionLines.join("\n"),
+              },
+            });
+
+            core.info(
+              `Classified ${comments.length} comment(s): ` +
+                `${HIGH.length} high/major, ${MEDIUM.length} medium, ` +
+                `${LOW.length} low/minor, ${UNKNOWN.length} unknown. ` +
+                `Conclusion: ${conclusion}.`,
+            );
+
+            if (blocking > 0) {
+              core.setFailed(
+                `${blocking} blocking bot finding(s) on PR #${prNumber}. ` +
+                  `Address them before merging.`,
+              );
+            }
