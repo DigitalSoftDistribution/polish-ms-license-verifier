@@ -11,14 +11,14 @@ name: bot-review-gate
 # fast-feedback during development but are no longer the source of truth.
 
 on:
+  # Triggers trimmed 2026-04-30: keep PR sync + submitted reviews.
+  # Dropped pull_request_review_comment + issue_comment because they fire
+  # on every comment edit (4-8 redundant runs per PR). Submitted reviews
+  # already cover the bot-finding state changes we actually care about.
   pull_request:
     types: [opened, synchronize, reopened]
   pull_request_review:
-    types: [submitted, edited]
-  pull_request_review_comment:
-    types: [created, edited]
-  issue_comment:
-    types: [created, edited]
+    types: [submitted]
 
 jobs:
   check:
